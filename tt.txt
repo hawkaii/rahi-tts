@@ -1,0 +1,71 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import torch
+from parler_tts import ParlerTTSForConditionalGeneration
+from transformers import AutoTokenizer
+import soundfile as sf
+import io
+import logging
+from fastapi.responses import Response  # Import Response
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Cabswale TTS Service")
+
+# Global variables
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+model = None
+tokenizer = None
+description_tokenizer = None
+
+
+class TTSRequest(BaseModel):
+    text: str
+    description: str = "A female speaker delivers a slightly expressive and animated speech with a very clear audio."
+
+
+@app.on_event("startup")
+async def load_model():
+    global model, tokenizer, description_tokenizer
+    logger.info(f"Loading model on {device}...")
+    model = ParlerTTSForConditionalGeneration.from_pretrained(
+        "ai4bharat/indic-parler-tts").to(device)
+    tokenizer = AutoTokenizer.from_pretrained("ai4bharat/indic-parler-tts")
+    description_tokenizer = AutoTokenizer.from_pretrained(
+        model.config.text_encoder._name_or_path)
+    logger.info("Model loaded successfully!")
+
+
+@app.post("/generate")
+async def generate_audio(request: TTSRequest):
+    try:
+        # Tokenize
+        description_input_ids = description_tokenizer(
+            request.description, return_tensors="pt").to(device)
+        prompt_input_ids = tokenizer(
+            request.text, return_tensors="pt").to(device)
+
+        # Generate
+        generation = model.generate(
+            input_ids=description_input_ids.input_ids,
+            attention_mask=description_input_ids.attention_mask,
+            prompt_input_ids=prompt_input_ids.input_ids,
+            prompt_attention_mask=prompt_input_ids.attention_mask
+        )
+
+        # Convert to numpy
+        audio_arr = generation.cpu().numpy().squeeze()
+
+        # Write to memory buffer as WAV
+        buffer = io.BytesIO()
+        sf.write(buffer, audio_arr, model.config.sampling_rate, format='WAV')
+        buffer.seek(0)
+
+        # Return RAW BYTES with correct MIME type
+        return Response(content=buffer.read(), media_type="audio/wav")
+
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
