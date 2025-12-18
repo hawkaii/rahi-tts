@@ -214,21 +214,21 @@ async def startup_event():
     description_tokenizer = AutoTokenizer.from_pretrained(
         model.config.text_encoder._name_or_path)
 
-     # Optimize
-     model.eval()
-     if torch.cuda.is_available():
-         torch.backends.cuda.matmul.allow_tf32 = True
-     
-     # Log attention mechanism being used
-     attn_impl = getattr(model.config, '_attn_implementation', 'default')
-     logger.info(f"Using attention implementation: {attn_impl}")
+    # Optimize
+    model.eval()
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+    
+    # Log attention mechanism being used
+    attn_impl = getattr(model.config, '_attn_implementation', 'default')
+    logger.info(f"Using attention implementation: {attn_impl}")
 
-     # Compile for extra speed (try/except in case of version mismatch)
-     try:
-         model = torch.compile(model, mode="reduce-overhead")
-         logger.info("Model compiled successfully")
-     except Exception as e:
-         logger.warning(f"Could not compile model (safe to ignore): {e}")
+    # Compile for extra speed (try/except in case of version mismatch)
+    try:
+        model = torch.compile(model, mode="reduce-overhead")
+        logger.info("Model compiled successfully")
+    except Exception as e:
+        logger.warning(f"Could not compile model (safe to ignore): {e}")
 
     # Initialize Queue and Worker
     tts_queue = asyncio.Queue(maxsize=QUEUE_SIZE)
