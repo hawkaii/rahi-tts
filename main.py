@@ -3,6 +3,7 @@ import re
 import asyncio
 import logging
 import time
+import os
 from dataclasses import dataclass, field
 from typing import List
 
@@ -21,6 +22,10 @@ from transformers import AutoTokenizer
 # T4 GPU works best with FP16. Drastically reduces VRAM and speeds up inference.
 DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# Attention implementation: "flash_attention_2", "sdpa", or "default"
+# Can be overridden via ATTN_IMPLEMENTATION environment variable
+ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "flash_attention_2")
 
 # Batching Parameters
 # Increased for T4 (16GB VRAM can handle this easily with FP16)
@@ -203,12 +208,46 @@ async def startup_event():
     global model, tokenizer, description_tokenizer, tts_queue
 
     logger.info(f"Loading Model on {DEVICE} with {DTYPE}...")
+    logger.info(f"Requested attention implementation: {ATTN_IMPLEMENTATION}")
 
     # Load Model with FP16 for Speed/Memory efficiency
-    model = ParlerTTSForConditionalGeneration.from_pretrained(
-        "ai4bharat/indic-parler-tts",
-        torch_dtype=DTYPE
-    ).to(DEVICE)
+    # Try to load with requested attention implementation, with graceful fallback
+    model_loaded = False
+    attn_to_try = [ATTN_IMPLEMENTATION]
+    
+    # Add fallback options if primary choice fails
+    if ATTN_IMPLEMENTATION != "sdpa":
+        attn_to_try.append("sdpa")
+    if ATTN_IMPLEMENTATION not in ["flash_attention_2", "sdpa"]:
+        attn_to_try.append("flash_attention_2")
+    
+    for attn_impl in attn_to_try:
+        try:
+            logger.info(f"Attempting to load model with attention: {attn_impl}")
+            model = ParlerTTSForConditionalGeneration.from_pretrained(
+                "ai4bharat/indic-parler-tts",
+                torch_dtype=DTYPE,
+                attn_implementation=attn_impl
+            ).to(DEVICE)
+            model_loaded = True
+            logger.info(f"✓ Successfully loaded model with {attn_impl} attention")
+            break
+        except Exception as e:
+            logger.warning(f"Failed to load with {attn_impl}: {e}")
+            continue
+    
+    if not model_loaded:
+        # Last resort: load without specifying attention implementation
+        try:
+            logger.info("Loading model with default attention implementation")
+            model = ParlerTTSForConditionalGeneration.from_pretrained(
+                "ai4bharat/indic-parler-tts",
+                torch_dtype=DTYPE
+            ).to(DEVICE)
+            logger.info("✓ Loaded model with default attention")
+        except Exception as e:
+            logger.error(f"Failed to load model with any configuration: {e}")
+            raise
 
     tokenizer = AutoTokenizer.from_pretrained("ai4bharat/indic-parler-tts")
     description_tokenizer = AutoTokenizer.from_pretrained(
@@ -221,7 +260,7 @@ async def startup_event():
     
     # Log attention mechanism being used
     attn_impl = getattr(model.config, '_attn_implementation', 'default')
-    logger.info(f"Using attention implementation: {attn_impl}")
+    logger.info(f"Active attention implementation: {attn_impl}")
 
     # Compile for extra speed (try/except in case of version mismatch)
     try:

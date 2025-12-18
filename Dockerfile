@@ -8,6 +8,7 @@ WORKDIR /app
 # Install deps
 # Removing specific constraints to let pip find the best compatible versions
 RUN pip install --no-cache-dir \
+    "flash-attn>=2.3.0" \
     "git+https://github.com/huggingface/parler-tts.git" \
     fastapi \
     uvicorn \
