@@ -108,6 +108,50 @@ def chunk_text(text: str, max_chars: int = 300) -> List[str]:
     return chunks
 
 # -------------------------------------------------
+# Model Warm-up
+# -------------------------------------------------
+
+
+def warmup_model():
+    """
+    Perform warm-up inference to trigger torch.compile compilation.
+    This prevents the first customer request from being extremely slow.
+    """
+    logger.info("🔥 Starting model warm-up for torch.compile...")
+    start_time = time.time()
+    
+    try:
+        # Create dummy inputs
+        dummy_text = "यह एक परीक्षण वाक्य है।"  # Hindi test sentence
+        dummy_description = "A female speaker delivers a slightly expressive and animated speech with a very clear audio."
+        
+        # Tokenize
+        desc_inputs = description_tokenizer(
+            [dummy_description], return_tensors="pt", padding=True
+        ).to(DEVICE)
+        
+        prompt_inputs = tokenizer(
+            [dummy_text], return_tensors="pt", padding=True
+        ).to(DEVICE)
+        
+        # Run inference to trigger compilation
+        with torch.no_grad():
+            _ = model.generate(
+                input_ids=desc_inputs.input_ids,
+                attention_mask=desc_inputs.attention_mask,
+                prompt_input_ids=prompt_inputs.input_ids,
+                prompt_attention_mask=prompt_inputs.attention_mask,
+                max_length=100,
+            )
+        
+        warmup_time = time.time() - start_time
+        logger.info(f"✓ Model warm-up complete in {warmup_time:.2f}s")
+        
+    except Exception as e:
+        logger.error(f"Warm-up failed: {e}")
+        logger.warning("Model will still work but first request may be slow")
+
+# -------------------------------------------------
 # The Batching Engine
 # -------------------------------------------------
 
@@ -262,13 +306,25 @@ async def startup_event():
     attn_impl = getattr(model.config, '_attn_implementation', 'default')
     logger.info(f"Active attention implementation: {attn_impl}")
 
-    # Compile for extra speed (try/except in case of version mismatch)
+    # Compile for extra speed with torch.compile
     try:
-        model = torch.compile(model, mode="reduce-overhead")
-        logger.info("Model compiled successfully")
+        # Check if triton is available (required for torch.compile CUDA optimization)
+        try:
+            import triton
+            logger.info(f"✓ Triton available (v{triton.__version__}) - torch.compile will be fast")
+        except ImportError:
+            logger.warning("⚠️  Triton not found - torch.compile will fall back to eager mode (no speedup)")
+        
+        logger.info("Compiling model with mode='reduce-overhead'...")
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+        logger.info("✓ Model compilation configured (actual compilation happens on first inference)")
     except Exception as e:
-        logger.warning(f"Could not compile model (safe to ignore): {e}")
+        logger.error(f"torch.compile failed: {e}")
+        logger.warning("Continuing without compilation")
 
+    # Warm up the model to trigger torch.compile compilation
+    await asyncio.to_thread(warmup_model)
+    
     # Initialize Queue and Worker
     tts_queue = asyncio.Queue(maxsize=QUEUE_SIZE)
     asyncio.create_task(batch_processor())

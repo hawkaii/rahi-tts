@@ -11,6 +11,9 @@ RUN pip install --no-cache-dir "flash-attn>=2.3.0"
 # Install transformers 4.48.0 which has better Flash Attention support
 RUN pip install --no-cache-dir "transformers==4.48.0"
 
+# Install triton for torch.compile CUDA kernel optimization
+RUN pip install --no-cache-dir "triton>=2.1.0"
+
 # Clone parler-tts and modify its dependencies to accept transformers 4.48.0
 RUN git clone https://github.com/huggingface/parler-tts.git /tmp/parler-tts && \
     cd /tmp/parler-tts && \
