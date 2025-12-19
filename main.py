@@ -67,10 +67,18 @@ class TTSRequest(BaseModel):
 # -------------------------------------------------
 
 
-def chunk_text(text: str, max_chars: int = 300) -> List[str]:
+def chunk_text(text: str, max_chars: int = 300, streaming_mode: bool = False) -> List[str]:
     """
     Smart chunking that respects Hindi/Indic sentence endings (Danda).
+    
+    Args:
+        text: Input text to chunk
+        max_chars: Maximum characters per chunk
+        streaming_mode: If True, uses smaller chunks (50-80 chars) for faster streaming
     """
+    # For streaming, use much smaller chunks for instant playback
+    if streaming_mode:
+        max_chars = 80  # Small chunks = fast generation = instant streaming
     # Split by common sentence terminators: ., ?, !, and Hindi Danda (।)
     # The regex keeps the delimiter attached to the sentence.
     sentence_endings = r'(?<=[.!?।])\s+'
@@ -441,45 +449,62 @@ async def generate_stream(req: TTSRequest):
         raise HTTPException(
             status_code=503, detail="Server is too busy, try again later.")
 
-    # 1. Chunk the text
-    text_chunks = chunk_text(req.text)
+    # 1. Chunk the text with smaller chunks for faster streaming
+    text_chunks = chunk_text(req.text, streaming_mode=True)
     if not text_chunks:
         raise HTTPException(status_code=400, detail="No valid text found.")
 
-    logger.info(f"Received streaming request: {len(text_chunks)} chunks")
+    logger.info(f"Received streaming request: {len(text_chunks)} chunks (streaming mode: small chunks)")
 
     async def audio_chunk_generator():
         """
         Generator that yields audio chunks as they complete.
-        This enables progressive playback without waiting for all chunks.
+        Uses micro-batching to submit multiple chunks but yield as soon as each completes.
         """
         try:
-            # 2. Process chunks one by one and yield immediately when ready
+            # 2. Submit ALL chunks to queue immediately (leverages batching)
+            futures = []
             for i, chunk in enumerate(text_chunks):
-                # Create job for this chunk
                 fut = asyncio.Future()
                 job = TTSJob(text=chunk, description=req.description, future=fut)
-                
-                # Queue the job (might pause if queue is full - backpressure)
                 await tts_queue.put(job)
+                futures.append(fut)
+            
+            logger.debug(f"Queued {len(text_chunks)} chunks for processing")
+            
+            # 3. Yield chunks as SOON as they complete (not in order, for fastest response)
+            # Use asyncio.wait to get results as they finish
+            pending = set(futures)
+            completed_count = 0
+            
+            while pending:
+                # Wait for next chunk to complete
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED
+                )
                 
-                # Wait for THIS chunk to complete (not all chunks)
-                audio_arr = await fut
-                
-                # Convert to WAV format
-                buffer = io.BytesIO()
-                sf.write(buffer, audio_arr, model.config.sampling_rate, format="WAV")
-                buffer.seek(0)
-                wav_data = buffer.read()
-                
-                # Yield chunk with boundary marker for multipart response
-                # Format: chunk index, total chunks, audio data
-                chunk_header = f"--chunk\r\nContent-Type: audio/wav\r\nX-Chunk-Index: {i}\r\nX-Total-Chunks: {len(text_chunks)}\r\n\r\n".encode()
-                yield chunk_header
-                yield wav_data
-                yield b"\r\n"
-                
-                logger.debug(f"Streamed chunk {i+1}/{len(text_chunks)}")
+                # Yield all completed chunks
+                for fut in done:
+                    completed_count += 1
+                    audio_arr = await fut
+                    
+                    # Convert to WAV format
+                    buffer = io.BytesIO()
+                    sf.write(buffer, audio_arr, model.config.sampling_rate, format="WAV")
+                    buffer.seek(0)
+                    wav_data = buffer.read()
+                    
+                    # Get chunk index
+                    chunk_idx = futures.index(fut)
+                    
+                    # Yield chunk with metadata
+                    chunk_header = f"--chunk\r\nContent-Type: audio/wav\r\nX-Chunk-Index: {chunk_idx}\r\nX-Total-Chunks: {len(text_chunks)}\r\n\r\n".encode()
+                    yield chunk_header
+                    yield wav_data
+                    yield b"\r\n"
+                    
+                    logger.debug(f"Streamed chunk {chunk_idx+1}/{len(text_chunks)} (completed {completed_count}/{len(text_chunks)})")
             
             # Final boundary marker
             yield b"--chunk--\r\n"
