@@ -30,7 +30,7 @@ ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "flash_attention_2")
 # Batching Parameters
 # Increased for T4 (16GB VRAM can handle this easily with FP16)
 BATCH_SIZE = 8
-MAX_WAIT_MS = 50        # Max time to wait for filling a batch
+MAX_WAIT_MS = 10        # Max time to wait for filling a batch (reduced for faster streaming)
 # Max pending chunks before rejecting requests (Backpressure)
 QUEUE_SIZE = 100
 
@@ -78,7 +78,7 @@ def chunk_text(text: str, max_chars: int = 300, streaming_mode: bool = False) ->
     """
     # For streaming, use much smaller chunks for instant playback
     if streaming_mode:
-        max_chars = 80  # Small chunks = fast generation = instant streaming
+        max_chars = 50  # Ultra-small chunks = sub-3s generation = instant streaming
     # Split by common sentence terminators: ., ?, !, and Hindi Danda (।)
     # The regex keeps the delimiter attached to the sentence.
     sentence_endings = r'(?<=[.!?।])\s+'
@@ -454,7 +454,11 @@ async def generate_stream(req: TTSRequest):
     if not text_chunks:
         raise HTTPException(status_code=400, detail="No valid text found.")
 
-    logger.info(f"Received streaming request: {len(text_chunks)} chunks (streaming mode: small chunks)")
+    # Log detailed chunk info
+    chunk_lengths = [len(chunk) for chunk in text_chunks]
+    logger.info(f"Received streaming request: {len(text_chunks)} chunks (streaming mode)")
+    logger.info(f"Chunk lengths: {chunk_lengths} (avg: {sum(chunk_lengths)/len(chunk_lengths):.1f} chars)")
+    logger.info(f"Total text: {len(req.text)} chars")
 
     async def audio_chunk_generator():
         """
@@ -462,6 +466,8 @@ async def generate_stream(req: TTSRequest):
         Uses micro-batching to submit multiple chunks but yield as soon as each completes.
         """
         try:
+            start_time = time.time()
+            
             # 2. Submit ALL chunks to queue immediately (leverages batching)
             futures = []
             for i, chunk in enumerate(text_chunks):
@@ -470,12 +476,14 @@ async def generate_stream(req: TTSRequest):
                 await tts_queue.put(job)
                 futures.append(fut)
             
-            logger.debug(f"Queued {len(text_chunks)} chunks for processing")
+            queue_time = time.time() - start_time
+            logger.info(f"✓ Queued {len(text_chunks)} chunks in {queue_time:.3f}s")
             
             # 3. Yield chunks as SOON as they complete (not in order, for fastest response)
             # Use asyncio.wait to get results as they finish
             pending = set(futures)
             completed_count = 0
+            first_chunk_time = None
             
             while pending:
                 # Wait for next chunk to complete
@@ -487,6 +495,13 @@ async def generate_stream(req: TTSRequest):
                 # Yield all completed chunks
                 for fut in done:
                     completed_count += 1
+                    chunk_complete_time = time.time() - start_time
+                    
+                    # Track first chunk time
+                    if first_chunk_time is None:
+                        first_chunk_time = chunk_complete_time
+                        logger.info(f"⚡ FIRST CHUNK ready in {first_chunk_time:.2f}s")
+                    
                     audio_arr = await fut
                     
                     # Convert to WAV format
@@ -504,11 +519,12 @@ async def generate_stream(req: TTSRequest):
                     yield wav_data
                     yield b"\r\n"
                     
-                    logger.debug(f"Streamed chunk {chunk_idx+1}/{len(text_chunks)} (completed {completed_count}/{len(text_chunks)})")
+                    logger.info(f"📦 Streamed chunk {chunk_idx}/{len(text_chunks)-1} at {chunk_complete_time:.2f}s (size: {len(wav_data):,} bytes)")
             
             # Final boundary marker
             yield b"--chunk--\r\n"
-            logger.info(f"Completed streaming {len(text_chunks)} chunks")
+            total_time = time.time() - start_time
+            logger.info(f"✅ Completed streaming {len(text_chunks)} chunks in {total_time:.2f}s (first: {first_chunk_time:.2f}s)")
             
         except Exception as e:
             logger.error(f"Streaming generation failed: {e}")
