@@ -108,6 +108,45 @@ def chunk_text(text: str, max_chars: int = 300) -> List[str]:
     return chunks
 
 # -------------------------------------------------
+# Audio Generation Utilities
+# -------------------------------------------------
+
+
+def calculate_max_new_tokens(text: str, frame_rate: int = 86, chars_per_second: int = 10) -> int:
+    """
+    Calculate appropriate max_new_tokens based on text length.
+    This prevents generating excessive trailing silence.
+    
+    Args:
+        text: Input text to be synthesized
+        frame_rate: Model's audio frame rate (tokens per second). Default 86 for Parler TTS.
+        chars_per_second: Estimated speaking rate in characters per second. 
+                         Default 10 is conservative for Hindi/Indic languages.
+    
+    Returns:
+        max_new_tokens: Maximum number of audio tokens to generate
+    """
+    # Estimate speech duration based on text length
+    estimated_duration_sec = len(text) / chars_per_second
+    
+    # Add 20% buffer for natural pauses and variation in speaking speed
+    buffered_duration_sec = estimated_duration_sec * 1.2
+    
+    # Add minimum 1 second safety margin
+    total_duration_sec = buffered_duration_sec + 1.0
+    
+    # Convert to tokens
+    max_new_tokens = int(total_duration_sec * frame_rate)
+    
+    # Enforce reasonable bounds
+    # Minimum: 100 tokens (~1.2 seconds) - enough for very short text
+    # Maximum: 2580 tokens (~30 seconds) - model's default max
+    max_new_tokens = max(100, min(max_new_tokens, 2580))
+    
+    return max_new_tokens
+
+
+# -------------------------------------------------
 # Model Warm-up
 # -------------------------------------------------
 
@@ -134,6 +173,9 @@ def warmup_model():
             [dummy_text], return_tensors="pt", padding=True
         ).to(DEVICE)
         
+        # Calculate appropriate max_new_tokens for warmup
+        warmup_max_tokens = calculate_max_new_tokens(dummy_text)
+        
         # Run inference to trigger compilation
         with torch.no_grad():
             _ = model.generate(
@@ -141,7 +183,8 @@ def warmup_model():
                 attention_mask=desc_inputs.attention_mask,
                 prompt_input_ids=prompt_inputs.input_ids,
                 prompt_attention_mask=prompt_inputs.attention_mask,
-                max_length=100,
+                max_new_tokens=warmup_max_tokens,
+                pad_token_id=1024,
             )
         
         warmup_time = time.time() - start_time
@@ -165,6 +208,13 @@ def run_model_inference(jobs: List[TTSJob]):
         texts = [j.text for j in jobs]
         descriptions = [j.description for j in jobs]
 
+        # Calculate max_new_tokens for the batch (use maximum from all texts)
+        # This ensures all texts in the batch have sufficient generation length
+        max_tokens_per_text = [calculate_max_new_tokens(text) for text in texts]
+        batch_max_new_tokens = max(max_tokens_per_text)
+        
+        logger.debug(f"Batch of {len(texts)} texts, max_new_tokens={batch_max_new_tokens}")
+
         # Tokenize
         desc_inputs = description_tokenizer(
             descriptions, return_tensors="pt", padding=True
@@ -174,14 +224,15 @@ def run_model_inference(jobs: List[TTSJob]):
             texts, return_tensors="pt", padding=True
         ).to(DEVICE)
 
-        # Generate (Blocking GPU Op)
+        # Generate (Blocking GPU Op) with dynamic max_new_tokens
         with torch.no_grad():
             generation = model.generate(
                 input_ids=desc_inputs.input_ids,
                 attention_mask=desc_inputs.attention_mask,
                 prompt_input_ids=prompt_inputs.input_ids,
                 prompt_attention_mask=prompt_inputs.attention_mask,
-                # Parler-TTS specific generation configs could go here
+                max_new_tokens=batch_max_new_tokens,  # Dynamically calculated
+                pad_token_id=1024,  # Explicit padding token
             )
 
         # Distribute results back to futures
